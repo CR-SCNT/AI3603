@@ -20,6 +20,7 @@ import math
 import pooltool as pt
 import numpy as np
 from pooltool.objects import PocketTableSpecs, Table, TableType
+from enum import Enum
 import copy
 import os
 from datetime import datetime
@@ -208,7 +209,7 @@ def analyze_shot_for_reward(shot: pt.System, last_state: dict, player_targets: l
     
     # 合法无进球小奖励
     if score == 0 and not cue_pocketed and not eight_pocketed and not foul_first_hit and not foul_no_rail:
-        score = 10
+        score = 4  
         
     return score
 
@@ -633,24 +634,161 @@ class MCTSNode:
         self.untried_actions.remove(action)
         return action
 
+# ============ 防守策略模块 ============
+
+class DefenseMode(Enum):
+    """台球防守模式枚举"""
+    AGGRESSIVE = 0      # 进攻模式：追求最大进球得分
+    BALANCED = 1        # 平衡模式：平衡攻防
+    DEFENSIVE = 2       # 防守模式：重点阻止对手得分
+
+
+def calculate_defensive_score(balls: dict, my_targets: list, 
+                             opponent_targets: list, action: dict, 
+                             shot: pt.System, table,
+                             distance_weight=0.2, blocking_weight=0.15, 
+                             position_weight=0.15):
+    """
+    计算一个动作的防守价值分数（不考虑进球得分）
+    
+    参数：
+        balls: 击球前的球状态
+        my_targets: 我的目标球
+        opponent_targets: 对手的目标球
+        action: 本次动作 {'V0', 'phi', 'theta', 'a', 'b'}
+        shot: 模拟后的System对象（已完成物理模拟）
+        table: 台面信息
+        distance_weight: 距离阻断权重 (default: 0.2)
+        blocking_weight: 球数阻断权重 (default: 0.15)
+        position_weight: 位置防守权重 (default: 0.15)
+    
+    返回：
+        float: 防守得分 (0-100)
+            计算三个防守指标：
+            1. 距离阻断：对手目标球与袋口的平均距离
+            2. 球数阻断：被遮挡的对手目标球数
+            3. 位置防守：白球的防守深度（停留在对手一侧）
+    """
+    try:
+        from utils import vec2, norm, angle_deg
+        
+        defensive_score = 0
+        
+        # ========== 指标1：距离阻断 ==========
+        # 计算对手目标球到最近袋口的距离
+        opponent_remaining = [bid for bid in opponent_targets 
+                                if shot.balls[bid].state.s != 4]  # 未进袋
+        
+        if opponent_remaining:
+            pockets = list(table.pockets.values())
+            min_distances = []
+            
+            for bid in opponent_remaining:
+                ball_pos = vec2(shot.balls[bid].state.rvw[0])
+                min_dist_to_pocket = min(
+                    np.linalg.norm(vec2(pk.center) - ball_pos)
+                    for pk in pockets
+                )
+                min_distances.append(min_dist_to_pocket)
+            
+            # 距离越远越好（平均距离标准化到0-100）
+            avg_distance = np.mean(min_distances) if min_distances else 0
+            distance_score = min(100, avg_distance * 15)  # 约6.7m = 100分
+            defensive_score += distance_weight * distance_score
+        
+        # ========== 指标2：球数阻断 ==========
+        # 计算有多少对手目标球被我方球遮挡
+        cue_pos = vec2(shot.balls['cue'].state.rvw[0])
+        R = 0.028575  # 球的半径
+        
+        blocked_count = 0
+        for bid in opponent_remaining:
+            target_pos = vec2(shot.balls[bid].state.rvw[0])
+            pockets = list(table.pockets.values())
+            
+            # 检查此球是否被当前白球位置"遮挡"（相对于最近的袋口）
+            nearest_pocket = min(pockets, 
+                                key=lambda pk: np.linalg.norm(vec2(pk.center) - target_pos))
+            pocket_center = vec2(nearest_pocket.center)
+            
+            # 判断白球是否在"目标球→袋口"的进球路线上
+            # 使用点到线段的距离：如果距离 < 球的半径，则认为有阻挡
+            path_dir = norm(pocket_center - target_pos)  # 进球方向单位向量
+            cue_to_target = cue_pos - target_pos  # 白球相对于目标球的向量
+            
+            # 计算白球在进球方向上的投影长度
+            projection_length = np.dot(cue_to_target, path_dir)
+            
+            # 白球在目标球和袋口之间，且距离进球路线足够近
+            if projection_length > 0 and projection_length < np.linalg.norm(pocket_center - target_pos):
+                # 计算白球到进球路线的垂直距离
+                projection_pos = target_pos + projection_length * path_dir
+                perp_dist = np.linalg.norm(cue_pos - projection_pos)
+                
+                if perp_dist < 2.1 * R:  # 2.1倍球半径的容差
+                    blocked_count += 1
+        
+        blocking_score = (blocked_count / max(1, len(opponent_remaining))) * 100
+        defensive_score += blocking_weight * blocking_score
+        
+        # ========== 指标3：位置防守 ==========
+        # 白球停留在对手球堆附近更好（防守深度）
+        # 计算白球到对手目标球群的距离
+        if opponent_remaining:
+            opponent_positions = [
+                vec2(shot.balls[bid].state.rvw[0]) 
+                for bid in opponent_remaining
+            ]
+            
+            # 对手球堆中心
+            opponent_center = np.mean([p for p in opponent_positions], axis=0)
+            
+            # 白球到对手球堆的距离（越近越好用于防守）
+            cue_pos = vec2(shot.balls['cue'].state.rvw[0])
+            dist_to_opponent = np.linalg.norm(cue_pos - opponent_center)
+            
+            # 距离标准化：约1.5m以内为最优防守位置
+            position_score = min(100, 100 * (1.5 / max(0.1, dist_to_opponent)))
+            defensive_score += position_weight * position_score
+        
+        return defensive_score
+        
+    except Exception as e:
+        # 防守计算失败时返回0分
+        print(f"[MCTSAgent] 计算防守分数时发生错误：{e}")
+        return 0
+
 
 class MCTSAgent(Agent):
     """基于蒙特卡洛树搜索的 Agent"""
     
     def __init__(self, num_iterations=50, exploration_c=1.414, 
-                 use_heuristic=True, verbose=False):
+                 use_heuristic=True, verbose=False, use_2step=True, 
+                 opponent_weight=0.7, use_defense=False, 
+                 defense_threshold=0.4, defense_weight=0.3):
         """
         参数：
             num_iterations: MCTS迭代次数
             exploration_c: UCB1探索系数
             use_heuristic: 是否使用启发式生成动作候选
             verbose: 是否打印调试信息
+            use_2step: 是否使用2步前向搜索（考虑对手回应）
+            opponent_weight: 对手得分的权重系数（0.5-1.0）
+            use_defense: 是否启用防守策略 (default: False)
+            defense_threshold: 触发防守模式的阈值 (default: 0.4, 0-1)
+            defense_weight: 防守得分的权重 (default: 0.3, 0-1)
         """
         super().__init__()
         self.num_iterations = num_iterations
         self.exploration_c = exploration_c
         self.use_heuristic = use_heuristic
         self.verbose = verbose
+        self.use_2step = use_2step
+        self.opponent_weight = opponent_weight
+        # 防守策略参数
+        self.use_defense = use_defense
+        self.defense_threshold = defense_threshold
+        self.defense_weight = defense_weight
         self.new_agent = NewAgent()  # 用于启发式候选和快速模拟
     
     def _generate_action_candidates(self, balls, my_targets, table, num_samples=10):
@@ -707,11 +845,96 @@ class MCTSAgent(Agent):
         """将动作转换为字典键（便于在字典中查找）"""
         return tuple(action[k] for k in ['V0', 'phi', 'theta', 'a', 'b'])
     
-    def _simulate_action(self, balls, table, action, my_targets):
+    def _infer_opponent_targets(self, balls, my_targets):
+        """
+        推断对手的目标球
+        
+        参数：
+            balls: 球状态
+            my_targets: 我的目标球
+        
+        返回：list, 对手的目标球ID列表
+        """
+        all_solid = ['1', '2', '3', '4', '5', '6', '7']
+        all_stripe = ['9', '10', '11', '12', '13', '14', '15']
+        
+        # 判断我的目标是什么
+        if my_targets == ['8']:
+            # 我已清台，对手目标未知，返回所有可能
+            remaining_solid = [bid for bid in all_solid if balls[bid].state.s != 4]
+            remaining_stripe = [bid for bid in all_stripe if balls[bid].state.s != 4]
+            return remaining_solid if len(remaining_solid) > 0 else remaining_stripe
+        
+        # 检查我是实心还是条纹
+        my_is_solid = any(bid in all_solid for bid in my_targets)
+        
+        if my_is_solid:
+            # 我是实心，对手是条纹
+            opponent_targets = [bid for bid in all_stripe if balls[bid].state.s != 4]
+        else:
+            # 我是条纹，对手是实心
+            opponent_targets = [bid for bid in all_solid if balls[bid].state.s != 4]
+        
+        # 如果对手已清台，目标是黑8
+        if len(opponent_targets) == 0:
+            opponent_targets = ['8']
+        
+        return opponent_targets
+    
+    def _select_defense_mode(self, balls, my_targets, opponent_targets):
+        """
+        【层2：防守模式选择】根据当前游戏状态选择防守模式
+        
+        参数：
+            balls: 当前球状态
+            my_targets: 我的目标球
+            opponent_targets: 对手的目标球
+        
+        返回：
+            DefenseMode: 选择的防守模式
+        
+        触发逻辑：
+            - 进攻模式：我的剩余目标球 ≤ 2 个（自动清台优先级最高）
+            - 防守模式：对手剩余目标球 ≤ 2 个（防止对手清台）
+            - 平衡模式：其他情况
+        """
+        # 统计剩余目标球数
+        my_remaining = sum(1 for bid in my_targets 
+                          if balls[bid].state.s != 4)
+        opp_remaining = sum(1 for bid in opponent_targets 
+                           if balls[bid].state.s != 4)
+        
+        # 优先级1：我即将清台 -> 进攻
+        if my_remaining <= 2:
+            if self.verbose:
+                print(f"[MCTS] 选择防守模式：进攻 (我剩余目标球: {my_remaining})")
+            return DefenseMode.AGGRESSIVE
+        
+        # 优先级2：对手即将清台 -> 防守
+        if opp_remaining <= 2:
+            if self.verbose:
+                print(f"[MCTS] 选择防守模式：防守 (对手剩余目标球: {opp_remaining})")
+            return DefenseMode.DEFENSIVE
+        
+        # 优先级3：其他情况 -> 平衡
+        if self.verbose:
+            print(f"[MCTS] 选择防守模式：平衡 (我剩余目标球: {my_remaining}, 对手剩余目标球: {opp_remaining})")
+        return DefenseMode.BALANCED
+    
+    def _simulate_action(self, balls, table, action, my_targets, opponent_targets=None):
         """
         快速模拟一个击球动作，返回奖励
         
-        返回：float, 该动作的奖励得分
+        【Layer 3】支持防守评分
+        
+        参数：
+            balls: 球状态
+            table: 球桌
+            action: 击球动作
+            my_targets: 我的目标球
+            opponent_targets: 对手的目标球（用于防守评分计算）
+        
+        返回：float, 该动作的综合奖励得分
         """
         try:
             last_state = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
@@ -733,13 +956,176 @@ class MCTSAgent(Agent):
             if not simulate_with_timeout(shot, timeout=3):
                 return 0  # 超时返回0分
             
-            # 计算奖励
-            score = analyze_shot_for_reward(shot, last_state, my_targets)
-            return score
+            # 计算基础奖励（进球得分）
+            reward = analyze_shot_for_reward(shot, last_state, my_targets)
+            
+            # 【Layer 3】如果启用防守策略，加入防守评分
+            if self.use_defense and opponent_targets is not None:
+                try:
+                    defense_score = calculate_defensive_score(
+                        balls=balls,
+                        my_targets=my_targets,
+                        opponent_targets=opponent_targets,
+                        action=action,
+                        shot=shot,
+                        table=table
+                    )
+                    # 防守得分加权（权重范围0-1）
+                    reward = reward + self.defense_weight * defense_score
+                    
+                    if self.verbose:
+                        print(f"[MCTS] 基础奖励: {reward-self.defense_weight*defense_score:.1f}, 防守得分: {defense_score:.1f}, 综合: {reward:.1f}")
+                except Exception as e:
+                    if self.verbose:
+                        print(f"[MCTS] 防守评分失败: {e}")
+                    # 防守评分失败，仅使用基础奖励
+            
+            return reward
             
         except Exception as e:
             if self.verbose:
                 print(f"[MCTS] 模拟失败: {e}")
+            return -500
+    
+    def _simulate_action_2step(self, balls, table, my_action, my_targets, opponent_targets):
+        """
+        2步前向搜索：模拟我的击球 + 对手的最佳回应
+        
+        参数：
+            balls: 球状态
+            table: 球桌
+            my_action: 我的击球动作
+            my_targets: 我的目标球
+            opponent_targets: 对手的目标球
+        
+        返回：
+            float, 综合评分 = my_reward - opponent_weight * opponent_best_reward
+        """
+        try:
+            # 步骤1：模拟我的击球
+            last_state = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
+            
+            sim_balls = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
+            sim_table = copy.deepcopy(table)
+            cue = pt.Cue(cue_ball_id="cue")
+            shot = pt.System(table=sim_table, balls=sim_balls, cue=cue)
+            
+            shot.cue.set_state(
+                V0=my_action['V0'], 
+                phi=my_action['phi'], 
+                theta=my_action['theta'], 
+                a=my_action['a'], 
+                b=my_action['b']
+            )
+            
+            # 使用超时保护
+            if not simulate_with_timeout(shot, timeout=3):
+                return 0
+            
+            # 步骤1：计算我的基础得分（不包含防守得分）
+            my_base_reward = analyze_shot_for_reward(shot, last_state, my_targets)
+            
+            # 获取我击球后的球状态
+            balls_after_my_shot = shot.balls
+            
+            # 步骤2：对手的最佳回应
+            # 检查对手是否还有球
+            opponent_remaining = [bid for bid in opponent_targets 
+                                if balls_after_my_shot[bid].state.s != 4]
+            
+            if len(opponent_remaining) == 0:
+                # 对手已清台，只考虑黑8
+                opponent_targets = ["8"]
+            else:
+                opponent_targets = opponent_remaining
+            
+            # 为对手生成少量候选动作（3-5个）
+            opponent_actions = self._generate_action_candidates(
+                balls_after_my_shot, opponent_targets, table, 
+                num_samples=3  # 减少对手的采样数，加快速度
+            )
+            
+            if not opponent_actions:
+                # 对手无法行动，返回我的综合得分
+                if self.use_defense:
+                    defense_score = calculate_defensive_score(
+                        balls=balls,
+                        my_targets=my_targets,
+                        opponent_targets=opponent_targets,
+                        action=my_action, 
+                        shot=shot,
+                        table=table
+                    )
+                    my_reward = my_base_reward + self.defense_weight * defense_score
+                else:
+                    my_reward = my_base_reward
+                return my_reward
+            
+            # 对手选择最好的动作
+            best_opponent_reward = -1e9
+            for opp_action in opponent_actions:
+                # 对手的simulate_action已包含防守得分
+                opp_reward = self._simulate_action(
+                    balls_after_my_shot, table, opp_action, opponent_targets
+                )
+                best_opponent_reward = max(best_opponent_reward, opp_reward)
+            
+            # 步骤3：【Layer 3】计算我方综合得分 = 基础得分 + 防守得分
+            if self.use_defense:
+                # 计算防守得分
+                defense_score = calculate_defensive_score(
+                    balls=balls,
+                    my_targets=my_targets,
+                    opponent_targets=opponent_targets,
+                    action=my_action,
+                    shot=shot,
+                    table=table
+                )
+                my_reward = my_base_reward + self.defense_weight * defense_score
+            else:
+                my_reward = my_base_reward
+            
+            # 步骤4：【Layer 3】根据防守模式调整综合评分公式
+            if self.use_defense:
+                # 动态模式选择
+                defense_mode = self._select_defense_mode(
+                    balls_after_my_shot, my_targets, opponent_targets
+                )
+                
+                if defense_mode == DefenseMode.AGGRESSIVE:
+                    # 进攻模式：我方即将清台，不太关心对手威胁
+                    # 公式: (基础得分 + 防守) - 0.3 * 对手得分
+                    # （权重低，对手威胁影响最小）
+                    final_score = my_reward - 0.3 * best_opponent_reward
+                    mode_name = "AGGRESSIVE"
+                    
+                elif defense_mode == DefenseMode.DEFENSIVE:
+                    # 防守模式：对手即将清台，非常关心对手威胁
+                    # 公式: (基础得分 + 防守) - 0.95 * 对手得分
+                    # （权重高，对手威胁影响最大，防守优先）
+                    final_score = my_reward - 0.85 * best_opponent_reward
+                    mode_name = "DEFENSIVE"
+                    
+                else:  # BALANCED
+                    # 平衡模式：正常情况，中等权重
+                    # 公式: (基础得分 + 防守) - opponent_weight * 对手得分
+                    final_score = my_reward - self.opponent_weight * best_opponent_reward
+                    mode_name = "BALANCED"
+                
+                if self.verbose:
+                    print(f"[2-Step] 模式: {mode_name}, 基础: {my_base_reward:.1f}, 防守: {defense_score:.1f}, 综合我: {my_reward:.1f}, 对手最佳: {best_opponent_reward:.1f}, 最终: {final_score:.1f}")
+            else:
+                # 不使用防守策略，使用原始公式
+                final_score = my_reward - self.opponent_weight * best_opponent_reward
+                
+                if self.verbose:
+                    print(f"[2-Step] 基础得分: {my_reward:.1f}, 对手最佳: {best_opponent_reward:.1f}, 综合: {final_score:.1f}")
+            
+            return final_score
+            
+        except Exception as e:
+            if self.verbose:
+                print(f"[MCTS 2-Step] 模拟失败: {e}")
             return -500
     
     def _selection(self, node):
@@ -786,12 +1172,15 @@ class MCTSAgent(Agent):
         
         return new_child
     
-    def _simulation(self, node, balls, my_targets, table):
+    def _simulation(self, node, balls, my_targets, table, opponent_targets=None):
         """
         模拟阶段：快速评估该节点的价值
         
-        这里我们直接模拟该节点的动作，得到立即奖励
-        （简化版：不进行深层前向搜索）
+        【Layer 3】支持防守评分的动态评估
+        
+        根据use_2step和use_defense参数决定模拟方式：
+        - use_2step=True: 2步前向搜索（考虑对手回应）
+        - use_defense=True: 加入防守评分
         
         返回：float, 该节点的奖励值
         """
@@ -799,8 +1188,24 @@ class MCTSAgent(Agent):
             # 根节点，不执行任何动作
             return 0
         
-        # 模拟该动作
-        reward = self._simulate_action(balls, table, node.action, my_targets)
+        # 根据配置选择模拟方式
+        if self.use_2step and opponent_targets is not None:
+            # 使用2步前向搜索（考虑对手回应）
+            reward = self._simulate_action_2step(
+                balls, table, node.action, my_targets, opponent_targets
+            )
+        else:
+            # 使用1步模拟
+            # 【Layer 3】如果启用防守，传递opponent_targets用于防守评分
+            if self.use_defense and opponent_targets is not None:
+                reward = self._simulate_action(
+                    balls, table, node.action, my_targets, opponent_targets
+                )
+            else:
+                reward = self._simulate_action(
+                    balls, table, node.action, my_targets, None
+                )
+        
         return reward
     
     def _backpropagation(self, node, reward):
@@ -812,7 +1217,7 @@ class MCTSAgent(Agent):
             node.value += reward
             node = node.parent
     
-    def search(self, balls, my_targets, table):
+    def search(self, balls, my_targets, table, opponent_targets=None):
         """
         执行MCTS搜索，返回最优动作
         
@@ -820,11 +1225,19 @@ class MCTSAgent(Agent):
             balls: 球状态字典
             my_targets: 目标球列表
             table: 球桌对象
+            opponent_targets: 对手的目标球列表（用于2步搜索）
         
         返回：dict, 最优击球动作
         """
         if self.verbose:
-            print(f"[MCTS] 开始搜索 (iterations={self.num_iterations})")
+            mode_str = "2步搜索" if (self.use_2step and opponent_targets) else "1步搜索"
+            print(f"[MCTS] 开始搜索 (iterations={self.num_iterations}, mode={mode_str})")
+        
+        # 如果启用2步搜索但没有提供对手目标球，自动推断
+        if self.use_2step and opponent_targets is None:
+            opponent_targets = self._infer_opponent_targets(balls, my_targets)
+            if self.verbose:
+                print(f"[MCTS] 推断对手目标球: {opponent_targets}")
         
         # 初始化根节点
         root = MCTSNode(state=(balls, my_targets, table), parent=None)
@@ -841,8 +1254,8 @@ class MCTSAgent(Agent):
             # 2. 扩展
             node = self._expansion(node, balls, my_targets, table)
             
-            # 3. 模拟
-            reward = self._simulation(node, balls, my_targets, table)
+            # 3. 模拟（可能使用2步搜索）
+            reward = self._simulation(node, balls, my_targets, table, opponent_targets)
             
             # 4. 反向传播
             self._backpropagation(node, reward)
@@ -870,7 +1283,7 @@ class MCTSAgent(Agent):
         
         return best_action
     
-    def decision(self, balls=None, my_targets=None, table=None):
+    def decision(self, balls=None, my_targets=None, table=None, opponent_targets=None):
         """
         Agent决策接口
         
@@ -878,6 +1291,7 @@ class MCTSAgent(Agent):
             balls: 球状态
             my_targets: 目标球
             table: 球桌
+            opponent_targets: 对手的目标球（可选，用于2步搜索）
         
         返回：dict, 击球动作
         """
@@ -890,7 +1304,8 @@ class MCTSAgent(Agent):
             if len(remaining) == 0:
                 my_targets = ["8"]
             
-            return self.search(balls, my_targets, table)
+            # 传递对手目标球信息（如果有）
+            return self.search(balls, my_targets, table, opponent_targets)
         
         except Exception as e:
             print(f"[MCTSAgent] 决策失败: {e}")
