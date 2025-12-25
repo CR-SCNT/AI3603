@@ -209,7 +209,7 @@ def analyze_shot_for_reward(shot: pt.System, last_state: dict, player_targets: l
     
     # 合法无进球小奖励
     if score == 0 and not cue_pocketed and not eight_pocketed and not foul_first_hit and not foul_no_rail:
-        score = 4  
+        score = 10  
         
     return score
 
@@ -646,8 +646,10 @@ class DefenseMode(Enum):
 def calculate_defensive_score(balls: dict, my_targets: list, 
                              opponent_targets: list, action: dict, 
                              shot: pt.System, table,
-                             distance_weight=0.2, blocking_weight=0.15, 
-                             position_weight=0.15):
+                             distance_weight=0.15, blocking_weight=0.10, 
+                             position_weight=0.10, scatter_weight=0.25,
+                             path_blocking_weight=0.25, critical_weight=0.10,
+                             safety_weight=0.05):
     """
     计算一个动作的防守价值分数（不考虑进球得分）
     
@@ -658,16 +660,24 @@ def calculate_defensive_score(balls: dict, my_targets: list,
         action: 本次动作 {'V0', 'phi', 'theta', 'a', 'b'}
         shot: 模拟后的System对象（已完成物理模拟）
         table: 台面信息
-        distance_weight: 距离阻断权重 (default: 0.2)
-        blocking_weight: 球数阻断权重 (default: 0.15)
-        position_weight: 位置防守权重 (default: 0.15)
+        distance_weight: 距离阻断权重 (default: 0.15)
+        blocking_weight: 球数阻断权重 (default: 0.10)
+        position_weight: 位置防守权重 (default: 0.10)
+        scatter_weight: 球群分散度权重 (default: 0.25) ⭐新增
+        path_blocking_weight: 路线阻挡权重 (default: 0.25) ⭐新增
+        critical_weight: 关键球防守权重 (default: 0.10)
+        safety_weight: 白球安全距离权重 (default: 0.05)
     
     返回：
         float: 防守得分 (0-100)
-            计算三个防守指标：
+            计算七个防守指标：
             1. 距离阻断：对手目标球与袋口的平均距离
             2. 球数阻断：被遮挡的对手目标球数
-            3. 位置防守：白球的防守深度（停留在对手一侧）
+            3. 位置防守：白球的防守深度
+            4. 球群分散度：对手目标球分布紧凑程度 ⭐新增
+            5. 路线阻挡：白球对多个对手进球路线的阻挡 ⭐新增
+            6. 关键球防守：白球是否防守容易进的球
+            7. 白球安全性：白球是否在安全距离
     """
     try:
         from utils import vec2, norm, angle_deg
@@ -750,6 +760,76 @@ def calculate_defensive_score(balls: dict, my_targets: list,
             # 距离标准化：约1.5m以内为最优防守位置
             position_score = min(100, 100 * (1.5 / max(0.1, dist_to_opponent)))
             defensive_score += position_weight * position_score
+        
+        # ========== 指标4：球群分散度 ==========
+        # 对手目标球分布越紧凑，防守越容易
+        if opponent_remaining and len(opponent_remaining) >= 2:
+            opponent_positions = [
+                vec2(shot.balls[bid].state.rvw[0]) 
+                for bid in opponent_remaining
+            ]
+            
+            # 计算球群的方差（紧凑度指标）
+            opponent_positions_array = np.array([list(p) for p in opponent_positions])
+            center = np.mean(opponent_positions_array, axis=0)
+            
+            # 计算每个球到中心的距离
+            distances_to_center = [
+                np.linalg.norm(pos - center) 
+                for pos in opponent_positions_array
+            ]
+            
+            # 方差越小 = 球越紧凑 = 防守越容易
+            scatter_variance = np.var(distances_to_center) if distances_to_center else 0
+            
+            # 标准化：方差0~0.3m² → 100~0分
+            # 方差越大（球越分散），防守得分越低
+            scatter_score = max(0, 100 - scatter_variance * 333)  # 333 = 100/0.3
+            defensive_score += scatter_weight * scatter_score
+        
+        # ========== 指标5：路线阻挡 ==========
+        # 白球对对手进球路线的阻挡程度
+        if opponent_remaining:
+            cue_pos = vec2(shot.balls['cue'].state.rvw[0])
+            pockets = list(table.pockets.values())
+            R = 0.028575
+            
+            # 计算白球对每个对手球的路线阻挡程度
+            total_path_blocking = 0.0
+            
+            for bid in opponent_remaining:
+                target_pos = vec2(shot.balls[bid].state.rvw[0])
+                
+                # 找到此球最近的袋口
+                nearest_pocket = min(pockets, 
+                                    key=lambda pk: np.linalg.norm(vec2(pk.center) - target_pos))
+                pocket_center = vec2(nearest_pocket.center)
+                
+                # 计算白球在进球路线上的阻挡程度（0~1）
+                path_dir = norm(pocket_center - target_pos)
+                cue_to_target = cue_pos - target_pos
+                
+                # 投影长度（白球沿进球方向的位置）
+                projection_length = np.dot(cue_to_target, path_dir)
+                path_length = np.linalg.norm(pocket_center - target_pos)
+                
+                # 如果白球在进球路线上（0 < 投影 < 路径长度）
+                if 0 < projection_length < path_length:
+                    # 计算垂直距离（越近阻挡越强）
+                    projection_pos = target_pos + projection_length * path_dir
+                    perp_dist = np.linalg.norm(cue_pos - projection_pos)
+                    
+                    # 垂直距离 < 10R时，认为有阻挡
+                    if perp_dist < 10 * R:
+                        # 阻挡强度 = 1 - (距离 / 10R)，范围0~1
+                        blocking_strength = 1.0 - (perp_dist / (10 * R))
+                        total_path_blocking += blocking_strength
+            
+            # 路线阻挡得分：标准化到0~100
+            # 如果能同时阻挡所有对手球的路线 = 100分
+            max_possible_blocking = len(opponent_remaining)
+            path_blocking_score = (total_path_blocking / max(1, max_possible_blocking)) * 100
+            defensive_score += path_blocking_weight * path_blocking_score
         
         return defensive_score
         
@@ -921,6 +1001,240 @@ class MCTSAgent(Agent):
             print(f"[MCTS] 选择防守模式：平衡 (我剩余目标球: {my_remaining}, 对手剩余目标球: {opp_remaining})")
         return DefenseMode.BALANCED
     
+    def _evaluation_position(self, shot, my_targets, opponent_targets, table):
+        """
+        评估白球停留位置的质量
+        
+        参数：
+            shot: 模拟后的 System 对象
+            my_targets: 我的目标球
+            opponent_targets: 对手的目标球
+            table: 击球后的台面信息
+        
+        返回：
+            float: 位置评分 (-10 到 +15)
+        """
+        try:
+            from utils import vec2
+            
+            score = 0.0
+            
+            # 获取白球位置
+            cue_pos = vec2(shot.balls['cue'].state.rvw[0])
+            
+            # 1. 白球距离对手目标球的距离评分 (+0 到 +10)
+            if opponent_targets:
+                opponent_positions = []
+                for bid in opponent_targets:
+                    if shot.balls[bid].state.s != 4:  # 未进袋
+                        opponent_positions.append(vec2(shot.balls[bid].state.rvw[0]))
+                
+                if opponent_positions:
+                    # 计算白球到对手球群的平均距离
+                    avg_dist = np.mean([np.linalg.norm(cue_pos - opp_pos) 
+                                       for opp_pos in opponent_positions])
+                    # 距离越远越好（>1.5m 为最佳）
+                    dist_score = min(10.0, avg_dist * 6.0)
+                    score += dist_score
+            
+            # 2. 白球安全性评分 (-10 到 +5)
+            # 检查白球是否贴库（不好的位置）
+            R = 0.028575  # 球半径
+            table_width = table.w
+            table_length = table.l
+            
+            # 动态阈值（基于球半径和球桌尺寸）
+            very_close_threshold = 5 * R      # ≈ 0.143m，非常贴库
+            close_threshold = 10 * R          # ≈ 0.286m，靠近边界
+            safe_threshold = max(15 * R, min(table_width, table_length) * 0.15)  # 至少15R或球桌短边的15%
+            
+            # 白球到边界的最小距离
+            margin_x = min(cue_pos[0], table_width - cue_pos[0])
+            margin_y = min(cue_pos[1], table_length - cue_pos[1])
+            min_margin = min(margin_x, margin_y)
+            
+            # 如果白球太靠近边界，扣分
+            if min_margin < very_close_threshold:
+                score -= 10.0
+            elif min_margin < close_threshold:
+                score -= 5.0
+            elif min_margin > safe_threshold:
+                # 白球在台面中央区域，加分
+                score += 5.0
+            
+            return score
+            
+        except Exception as e:
+            # 评估失败，返回0分
+            print(f"[MCTSAgent] 评估位置分数时发生错误：{e}")
+            return 0.0
+    
+    def _calculate_black_ball_risk(self, shot: pt.System, my_targets: list, table) -> float:
+        """
+        计算黑8球风险分数（不包括首球犯规，首球犯规在_analyze_shot中已处理）
+        
+        参数：
+            shot: 模拟后的 System 对象
+            my_targets: 我的目标球列表
+            table: 击球后的台面信息
+        
+        返回：
+            float: 风险分数 (0-10)，越高表示风险越大
+        """
+        try:
+            from utils import vec2
+            
+            # 只在清台前评估黑8风险
+            if '8' in my_targets:
+                return 0.0
+            
+            risk_score = 0.0
+            
+            # 1. 检查黑8击球后的位置风险
+            if '8' in shot.balls and shot.balls['8'].state.s != 4:  # 黑8未进袋
+                black_8_pos = vec2(shot.balls['8'].state.rvw[0])
+                pockets = list(table.pockets.values())
+                
+                # 找到最近的袋口
+                min_dist_to_pocket = min(
+                    np.linalg.norm(vec2(pk.center) - black_8_pos)
+                    for pk in pockets
+                )
+                
+                R = 0.028575  # 球半径
+                # 黑8非常接近袋口（意外进袋风险）
+                if min_dist_to_pocket < 5 * R:  # < 0.143m
+                    risk_score += 8.0  # 高风险：黑8可能被后续球碰进
+                elif min_dist_to_pocket < 8 * R:  # < 0.229m
+                    risk_score += 4.0   # 中等风险
+                elif min_dist_to_pocket < 12 * R:  # < 0.343m
+                    risk_score += 2.0   # 低风险
+            
+            return risk_score
+            
+        except Exception as e:
+            # 计算失败时返回0分
+            if self.verbose:
+                print(f"[MCTSAgent] 计算黑8风险时发生错误：{e}")
+            return 0.0
+        
+    
+    def _analyze_shot(self, shot: pt.System, last_state: dict, player_targets: list, table) -> float:
+        """
+        分析一次击球的结果，计算奖励分数
+        基于 analyze_shot_for_reward 函数
+        
+        参数:
+            shot: 模拟后的 System 对象
+            last_state: 击球前的球状态快照
+            player_targets: 我的目标球列表
+            table: 击球后的台面信息
+        """
+        # 1. 基本分析
+        opponent_targets = self._infer_opponent_targets(shot.balls, player_targets)
+        
+        new_pocketed = [bid for bid, b in shot.balls.items() if b.state.s == 4 and last_state[bid].state.s != 4]
+        
+        # 根据 player_targets 判断进球归属（黑8只有在清台后才算己方球）
+        own_pocketed = [bid for bid in new_pocketed if bid in player_targets]
+        enemy_pocketed = [bid for bid in new_pocketed if bid not in player_targets and bid not in ["cue", "8"]]
+        
+        my_remaining = len([b for b in player_targets if b != '8' and shot.balls[b].state.s != 4])
+        opp_remaining = len([b for b in opponent_targets if b != '8' and shot.balls[b].state.s != 4])
+
+        
+        cue_pocketed = "cue" in new_pocketed
+        eight_pocketed = "8" in new_pocketed
+
+        # 2. 分析首球碰撞（定义合法的球ID集合）
+        first_contact_ball_id = None
+        foul_first_hit = False
+        valid_ball_ids = {'1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12', '13', '14', '15'}
+        
+        for e in shot.events:
+            et = str(e.event_type).lower()
+            ids = list(e.ids) if hasattr(e, 'ids') else []
+            if ('cushion' not in et) and ('pocket' not in et) and ('cue' in ids):
+                # 过滤掉 'cue' 和非球对象（如 'cue stick'），只保留合法的球ID
+                other_ids = [i for i in ids if i != 'cue' and i in valid_ball_ids]
+                if other_ids:
+                    first_contact_ball_id = other_ids[0]
+                    break
+        
+        # 首球犯规判定：完全对齐 player_targets
+        if first_contact_ball_id is None:
+            # 未击中任何球（但若只剩白球和黑8且已清台，则不算犯规）
+            if len(last_state) > 2 or player_targets != ['8']:
+                foul_first_hit = True
+        else:
+            # 首次击打的球必须是 player_targets 中的球
+            if first_contact_ball_id not in player_targets:
+                foul_first_hit = True
+        
+        # 3. 分析碰库
+        cue_hit_cushion = False
+        target_hit_cushion = False
+        foul_no_rail = False
+        
+        for e in shot.events:
+            et = str(e.event_type).lower()
+            ids = list(e.ids) if hasattr(e, 'ids') else []
+            if 'cushion' in et:
+                if 'cue' in ids:
+                    cue_hit_cushion = True
+                if first_contact_ball_id is not None and first_contact_ball_id in ids:
+                    target_hit_cushion = True
+
+        if len(new_pocketed) == 0 and first_contact_ball_id is not None and (not cue_hit_cushion) and (not target_hit_cushion):
+            foul_no_rail = True
+            
+        # 4. 计算奖励分数
+        score = 0
+        if my_remaining <= 2:
+            pocket_reward = 100
+        elif my_remaining >= 6:
+            pocket_reward = 60
+        else:
+            pocket_reward = 75 
+        
+        # 白球进袋处理
+        if cue_pocketed and eight_pocketed:
+            score -= 150  # 白球+黑8同时进袋，严重犯规
+        elif cue_pocketed:
+            score -= 100  # 白球进袋
+        elif eight_pocketed:
+            # 黑8进袋：只有清台后（player_targets == ['8']）才合法
+            if player_targets == ['8']:
+                score += 100  # 合法打进黑8
+            else:
+                score -= 150  # 清台前误打黑8，判负
+                
+        # 首球犯规和碰库犯规
+        if foul_first_hit:
+            if first_contact_ball_id == '8':
+                score -= 50  # 首球犯规且打到黑8，严重犯规
+            else:
+                score -= 25
+        if foul_no_rail:
+            score -= 25
+            
+        # 进球得分（own_pocketed 已根据 player_targets 正确分类）
+        score += len(own_pocketed) * pocket_reward
+        score -= len(enemy_pocketed) * 20
+        
+        # 合法无进球
+        if score == 0 and not cue_pocketed and not eight_pocketed and not foul_first_hit and not foul_no_rail:
+            # 根据停球位置给予少量奖励
+            position_score = self._evaluation_position(shot, player_targets, opponent_targets, table)
+            score = 5 + position_score
+            
+        # 黑8风险评估
+        if '8' not in player_targets:
+            black_ball_risk = self._calculate_black_ball_risk(shot, player_targets, table)
+            score -= black_ball_risk  
+            
+        return score
+    
     def _simulate_action(self, balls, table, action, my_targets, opponent_targets=None):
         """
         快速模拟一个击球动作，返回奖励
@@ -956,8 +1270,9 @@ class MCTSAgent(Agent):
             if not simulate_with_timeout(shot, timeout=3):
                 return 0  # 超时返回0分
             
+            
             # 计算基础奖励（进球得分）
-            reward = analyze_shot_for_reward(shot, last_state, my_targets)
+            reward = self._analyze_shot(shot, last_state, my_targets, sim_table)
             
             # 【Layer 3】如果启用防守策略，加入防守评分
             if self.use_defense and opponent_targets is not None:
@@ -1023,7 +1338,7 @@ class MCTSAgent(Agent):
                 return 0
             
             # 步骤1：计算我的基础得分（不包含防守得分）
-            my_base_reward = analyze_shot_for_reward(shot, last_state, my_targets)
+            my_base_reward = self._analyze_shot(shot, last_state, my_targets, sim_table)
             
             # 获取我击球后的球状态
             balls_after_my_shot = shot.balls
@@ -1042,7 +1357,7 @@ class MCTSAgent(Agent):
             # 为对手生成少量候选动作（3-5个）
             opponent_actions = self._generate_action_candidates(
                 balls_after_my_shot, opponent_targets, table, 
-                num_samples=3  # 减少对手的采样数，加快速度
+                num_samples=5  # 减少对手的采样数，加快速度
             )
             
             if not opponent_actions:
