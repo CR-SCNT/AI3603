@@ -26,9 +26,10 @@ import os
 from datetime import datetime
 import random
 import signal
-from threading import Timer
 import threading
 import platform
+import multiprocessing
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 # from poolagent.pool import Pool as CuetipEnv, State as CuetipState
 # from poolagent import FunctionAgent
 
@@ -59,53 +60,108 @@ def simulate_with_timeout(shot, timeout=3):
         在 Unix/Linux 上使用 signal.SIGALRM，在 Windows 上使用线程超时
         超时后自动恢复，不会导致程序卡死
     """
+    # timeout<=0: treat as no-timeout (avoid signal/threadpool overhead)
+    if timeout is None or timeout <= 0:
+        pt.simulate(shot, inplace=True)
+        return True
+
     is_unix = platform.system() in ('Linux', 'Darwin')
+    is_main_thread = threading.current_thread() is threading.main_thread()
     
-    if is_unix:
-        # Unix/Linux 使用 signal.SIGALRM
+    # Unix/Linux：signal 只能在主线程使用。并行线程内无法可靠设置 SIGALRM。
+    if is_unix and is_main_thread:
         old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
-        signal.alarm(timeout)  # 设置超时时间
-        
+        signal.alarm(timeout)
         try:
             pt.simulate(shot, inplace=True)
-            signal.alarm(0)  # 取消超时
+            signal.alarm(0)
             return True
         except SimulationTimeoutError:
             print(f"[WARNING] 物理模拟超时（>{timeout}秒），跳过此次模拟")
             return False
         except Exception as e:
-            signal.alarm(0)  # 取消超时
+            signal.alarm(0)
             raise e
         finally:
-            signal.signal(signal.SIGALRM, old_handler)  # 恢复原处理器
-    else:
-        # Windows 使用线程超时机制
-        result = [False]
-        exception = [None]
-        
-        def simulate_task():
-            try:
-                pt.simulate(shot, inplace=True)
-                result[0] = True
-            except Exception as e:
-                exception[0] = e
-        
-        thread = Timer(timeout, lambda: None)
-        thread.daemon = True
-        
-        import threading
-        sim_thread = threading.Thread(target=simulate_task, daemon=True)
-        sim_thread.start()
-        sim_thread.join(timeout=timeout)
-        
-        if sim_thread.is_alive():
-            print(f"[WARNING] 物理模拟超时（>{timeout}秒），跳过此次模拟")
-            return False
-        
-        if exception[0] is not None:
-            raise exception[0]
-        
-        return result[0]
+            signal.signal(signal.SIGALRM, old_handler)
+    
+    # Unix/Linux 的非主线程：无法用 signal 超时；直接模拟（避免并行时大量异常/失败）。
+    if is_unix and (not is_main_thread):
+        try:
+            pt.simulate(shot, inplace=True)
+            return True
+        except Exception as e:
+            raise e
+
+    # Windows 或其他：使用 future 等待超时
+    # Windows 无法可靠中断正在运行的线程，因此不要为每次模拟创建新线程。
+    # 这里复用一个全局线程池执行 pt.simulate，并用 future 超时等待：
+    # - 若任务尚未开始，超时后可 cancel，避免堆积
+    # - 若任务已开始，无法强制终止，但并发会被池大小严格限制，不会无限增生线程
+    global _WINDOWS_SIM_EXECUTOR
+    try:
+        _WINDOWS_SIM_EXECUTOR
+    except NameError:
+        _WINDOWS_SIM_EXECUTOR = None
+
+    if _WINDOWS_SIM_EXECUTOR is None:
+        # 默认给一个“很小但 >1” 的上限：既能并行跑少量模拟，
+        # 又能避免旧实现那种超时线程无限增生导致的并发失控。
+        # 如需更高并发，可通过环境变量 POOLTOOL_SIM_WORKERS 调整。
+        default_workers = min(4, (os.cpu_count() or 1))
+        max_workers = int(os.environ.get("POOLTOOL_SIM_WORKERS", str(default_workers)))
+        max_workers = max(1, max_workers)
+        _WINDOWS_SIM_EXECUTOR = ThreadPoolExecutor(max_workers=max_workers)
+
+    future = _WINDOWS_SIM_EXECUTOR.submit(pt.simulate, shot, inplace=True)
+    try:
+        future.result(timeout=timeout)
+        return True
+    except FuturesTimeoutError:
+        # 如果任务还没开始，尽量取消，避免排队堆积
+        future.cancel()
+        print(f"[WARNING] 物理模拟超时（>{timeout}秒），跳过此次模拟")
+        return False
+    except Exception as e:
+        raise e
+
+
+# ---- Process-pool helpers for root-parallel MCTS (Linux-friendly, avoids GIL) ----
+_MCTS_WORKER_AGENT = None
+
+
+def _init_mcts_worker(agent_kwargs: dict):
+    global _MCTS_WORKER_AGENT
+    agent_kwargs = dict(agent_kwargs)
+    agent_kwargs['use_parallel'] = False
+    _MCTS_WORKER_AGENT = MCTSAgent(**agent_kwargs)
+
+
+def _mcts_root_parallel_worker(payload: dict):
+    agent = _MCTS_WORKER_AGENT
+    if agent is None:
+        raise RuntimeError("MCTS worker not initialized")
+
+    balls = payload['balls']
+    my_targets = payload['my_targets']
+    table = payload['table']
+    opponent_targets = payload['opponent_targets']
+    base_candidates = payload['base_candidates']
+    n_iters = int(payload['n_iters'])
+
+    local_root = MCTSNode(state=(balls, my_targets, table), parent=None)
+    local_root.untried_actions = list(base_candidates)
+
+    for _ in range(n_iters):
+        node = agent._selection(local_root)
+        node = agent._expansion(node, balls, my_targets, table)
+        reward = agent._simulation(node, balls, my_targets, table, opponent_targets)
+        agent._backpropagation(node, reward)
+
+    stats = {}
+    for action_key, child in local_root.children.items():
+        stats[action_key] = (child.visits, child.value, child.action)
+    return stats
 
 # ============================================
 
@@ -845,7 +901,9 @@ class MCTSAgent(Agent):
     def __init__(self, num_iterations=50, exploration_c=1.414, 
                  use_heuristic=True, verbose=False, use_2step=True, 
                  opponent_weight=0.7, use_defense=False, 
-                 defense_threshold=0.4, defense_weight=0.3):
+                 defense_threshold=0.4, defense_weight=0.3,
+                 use_parallel=False, num_workers=4, parallel_backend=None,
+                 sim_timeout=3):
         """
         参数：
             num_iterations: MCTS迭代次数
@@ -857,6 +915,10 @@ class MCTSAgent(Agent):
             use_defense: 是否启用防守策略 (default: False)
             defense_threshold: 触发防守模式的阈值 (default: 0.4, 0-1)
             defense_weight: 防守得分的权重 (default: 0.3, 0-1)
+            use_parallel: 是否使用多线程并行化 (default: False)
+            num_workers: 线程池大小 (default: 4)
+            parallel_backend: 并行后端: None(自动) / 'thread' / 'process'
+            sim_timeout: 单次物理模拟超时秒数；<=0 表示不启用超时 (default: 3)
         """
         super().__init__()
         self.num_iterations = num_iterations
@@ -869,7 +931,65 @@ class MCTSAgent(Agent):
         self.use_defense = use_defense
         self.defense_threshold = defense_threshold
         self.defense_weight = defense_weight
+        # 多线程参数
+        self.use_parallel = use_parallel
+        self.num_workers = num_workers
+        if parallel_backend is None:
+            # Linux/Darwin 默认用进程并行绕过GIL；Windows默认线程（spawn开销大）
+            self.parallel_backend = 'process' if platform.system() in ('Linux', 'Darwin') else 'thread'
+        else:
+            self.parallel_backend = str(parallel_backend).lower()
+        self._parallel_executor = None
+        self.sim_timeout = sim_timeout
         self.new_agent = NewAgent()  # 用于启发式候选和快速模拟
+
+    def _get_parallel_executor(self):
+        if self._parallel_executor is not None:
+            return self._parallel_executor
+
+        workers = max(1, int(self.num_workers))
+        backend = self.parallel_backend
+        if backend == 'process':
+            # Prefer fork on Unix to reduce startup overhead; fall back to default context.
+            ctx = None
+            if platform.system() in ('Linux', 'Darwin'):
+                try:
+                    ctx = multiprocessing.get_context('fork')
+                except Exception:
+                    ctx = None
+
+            agent_kwargs = {
+                'num_iterations': self.num_iterations,
+                'exploration_c': self.exploration_c,
+                'use_heuristic': self.use_heuristic,
+                'verbose': False,
+                'use_2step': self.use_2step,
+                'opponent_weight': self.opponent_weight,
+                'use_defense': self.use_defense,
+                'defense_threshold': self.defense_threshold,
+                'defense_weight': self.defense_weight,
+                'use_parallel': False,
+                'num_workers': 1,
+                'parallel_backend': 'thread',
+            }
+
+            self._parallel_executor = ProcessPoolExecutor(
+                max_workers=workers,
+                mp_context=ctx,
+                initializer=_init_mcts_worker,
+                initargs=(agent_kwargs,),
+            )
+        else:
+            self._parallel_executor = ThreadPoolExecutor(max_workers=workers)
+
+        return self._parallel_executor
+
+    def __del__(self):
+        try:
+            if self._parallel_executor is not None:
+                self._parallel_executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
     
     def _generate_action_candidates(self, balls, my_targets, table, num_samples=10):
         """
@@ -1269,7 +1389,7 @@ class MCTSAgent(Agent):
             )
             
             # 使用超时保护
-            if not simulate_with_timeout(shot, timeout=3):
+            if not simulate_with_timeout(shot, timeout=self.sim_timeout):
                 return 0  # 超时返回0分
             
             
@@ -1336,7 +1456,7 @@ class MCTSAgent(Agent):
             )
             
             # 使用超时保护
-            if not simulate_with_timeout(shot, timeout=3):
+            if not simulate_with_timeout(shot, timeout=self.sim_timeout):
                 return 0
             
             # 步骤1：计算我的基础得分（不包含防守得分）
@@ -1548,7 +1668,8 @@ class MCTSAgent(Agent):
         """
         if self.verbose:
             mode_str = "2步搜索" if (self.use_2step and opponent_targets) else "1步搜索"
-            print(f"[MCTS] 开始搜索 (iterations={self.num_iterations}, mode={mode_str})")
+            parallel_str = f", 并行={self.num_workers}线程" if self.use_parallel else ""
+            print(f"[MCTS] 开始搜索 (iterations={self.num_iterations}, mode={mode_str}{parallel_str})")
         
         # 如果启用2步搜索但没有提供对手目标球，自动推断
         if self.use_2step and opponent_targets is None:
@@ -1563,22 +1684,11 @@ class MCTSAgent(Agent):
             num_samples=10
         )
         
-        # 执行迭代
-        for iteration in range(self.num_iterations):
-            # 1. 选择
-            node = self._selection(root)
-            
-            # 2. 扩展
-            node = self._expansion(node, balls, my_targets, table)
-            
-            # 3. 模拟（可能使用2步搜索）
-            reward = self._simulation(node, balls, my_targets, table, opponent_targets)
-            
-            # 4. 反向传播
-            self._backpropagation(node, reward)
-            
-            if self.verbose and (iteration + 1) % 10 == 0:
-                print(f"[MCTS] 迭代 {iteration + 1}/{self.num_iterations}")
+        # 选择执行模式：串行 vs 并行
+        if self.use_parallel:
+            self._search_parallel(root, balls, my_targets, table, opponent_targets)
+        else:
+            self._search_sequential(root, balls, my_targets, table, opponent_targets)
         
         # 选择访问次数最多的子节点对应的动作
         best_child = max(
@@ -1599,6 +1709,97 @@ class MCTSAgent(Agent):
                   f"平均奖励={avg_reward:.2f}")
         
         return best_action
+    
+    def _search_sequential(self, root, balls, my_targets, table, opponent_targets):
+        """串行MCTS搜索（原始版本）"""
+        for iteration in range(self.num_iterations):
+            # 1. 选择
+            node = self._selection(root)
+            
+            # 2. 扩展
+            node = self._expansion(node, balls, my_targets, table)
+            
+            # 3. 模拟（可能使用2步搜索）
+            reward = self._simulation(node, balls, my_targets, table, opponent_targets)
+            
+            # 4. 反向传播
+            self._backpropagation(node, reward)
+            
+            if self.verbose and (iteration + 1) % 10 == 0:
+                print(f"[MCTS] 迭代 {iteration + 1}/{self.num_iterations}")
+    
+    def _search_parallel(self, root, balls, my_targets, table, opponent_targets):
+        """并行MCTS搜索（root-parallel；thread/process 可选）"""
+        # 共享一棵树的 tree-parallel 在没有 virtual loss 时容易出现“扎堆同一路径”
+        # 且在 Unix 的非主线程下 signal 超时不可用，会导致大量模拟失败。
+        # 这里改为 root-parallel：每个线程独立跑一棵树，最后在根节点聚合统计。
+
+        base_candidates = list(root.untried_actions) if root.untried_actions else self._generate_action_candidates(
+            balls, my_targets, table, num_samples=10
+        )
+
+        # 将总迭代数均分到各线程
+        workers = max(1, int(self.num_workers))
+        total_iters = int(self.num_iterations)
+        iters_per_worker = [total_iters // workers] * workers
+        for i in range(total_iters % workers):
+            iters_per_worker[i] += 1
+
+        merged = {}
+        executor = self._get_parallel_executor()
+        backend = self.parallel_backend
+
+        payloads = [
+            {
+                'balls': balls,
+                'my_targets': my_targets,
+                'table': table,
+                'opponent_targets': opponent_targets,
+                'base_candidates': base_candidates,
+                'n_iters': n,
+            }
+            for n in iters_per_worker if n > 0
+        ]
+
+        if backend == 'process':
+            futures = [executor.submit(_mcts_root_parallel_worker, p) for p in payloads]
+        else:
+            def _thread_worker(p: dict):
+                local_root = MCTSNode(state=(p['balls'], p['my_targets'], p['table']), parent=None)
+                local_root.untried_actions = list(p['base_candidates'])
+                for _ in range(int(p['n_iters'])):
+                    node = self._selection(local_root)
+                    node = self._expansion(node, p['balls'], p['my_targets'], p['table'])
+                    reward = self._simulation(node, p['balls'], p['my_targets'], p['table'], p['opponent_targets'])
+                    self._backpropagation(node, reward)
+                stats = {}
+                for action_key, child in local_root.children.items():
+                    stats[action_key] = (child.visits, child.value, child.action)
+                return stats
+
+            futures = [executor.submit(_thread_worker, p) for p in payloads]
+
+        for fut in as_completed(futures):
+            try:
+                stats = fut.result()
+            except Exception as e:
+                if self.verbose:
+                    print(f"[MCTS] 并行worker异常: {e}")
+                continue
+
+            for action_key, (visits, value, action) in stats.items():
+                if action_key not in merged:
+                    merged[action_key] = [0, 0.0, action]
+                merged[action_key][0] += visits
+                merged[action_key][1] += value
+
+        # 将聚合结果写回 root.children，后续按 visits 选最优
+        root.children = {}
+        for action_key, (visits, value, action) in merged.items():
+            child = MCTSNode(state=root.state, parent=root, action=action)
+            child.visits = visits
+            child.value = value
+            root.children[action_key] = child
     
     def decision(self, balls=None, my_targets=None, table=None, opponent_targets=None):
         """
