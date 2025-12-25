@@ -161,7 +161,7 @@ def main():
     env = PoolEnv()
     n_games = 20  # 对战局数 自己测试时可以修改 扩充为120局为了减少随机带来的扰动
 
-    agent_a, agent_b = MCTSAgent(num_iterations=20, use_2step=False, use_defense=False), MCTSAgent(num_iterations=20, use_2step=False, use_defense=False)
+    agent_a, agent_b = MCTSAgent(num_iterations=50, use_2step=False, use_defense=False), MCTSAgent(num_iterations=50, use_2step=True, use_defense=True)
     
     # 初始化日志记录器
     logger = EvaluationLogger(
@@ -174,6 +174,9 @@ def main():
     results = {'AGENT_A_WIN': 0.0, 'AGENT_B_WIN': 0.0, 'SAME': 0.0, 'AVG_GAME_TIME': 0.0, 'AGENT_A_SCORE': 0.0, 'AGENT_B_SCORE': 0.0}
     # 记录每局时长（秒）
     game_times = []
+    # 记录白球入袋次数、黑八非法入袋次数等其他统计数据（待实现）
+    cue_pocketed_counts = {'A': 0, 'B': 0}
+    black8_foul_counts = {'A': 0, 'B': 0}
     
     players = [agent_a, agent_b]  # 用于切换先后手
     target_ball_choice = ['solid', 'solid', 'stripe', 'stripe']  # 轮换球型

@@ -1066,7 +1066,10 @@ class MCTSAgent(Agent):
             
         except Exception as e:
             # 评估失败，返回0分
-            print(f"[MCTSAgent] 评估位置分数时发生错误：{e}")
+            if self.verbose:
+                print(f"[MCTSAgent] 评估位置分数时发生错误：{e}")
+                import traceback
+                traceback.print_exc()
             return 0.0
     
     def _calculate_black_ball_risk(self, shot: pt.System, my_targets: list, table) -> float:
@@ -1118,7 +1121,6 @@ class MCTSAgent(Agent):
                 print(f"[MCTSAgent] 计算黑8风险时发生错误：{e}")
             return 0.0
         
-    
     def _analyze_shot(self, shot: pt.System, last_state: dict, player_targets: list, table) -> float:
         """
         分析一次击球的结果，计算奖励分数
